@@ -3,7 +3,7 @@ import numpy as np
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-EMBEDDINGS_IN = ROOT / 'indexes' / 'embeddings.npy'
+EMBEDDINGS_IN = ROOT / 'indexes' / 'image_embeddings.npy'
 FAISS_OUT = ROOT / 'indexes' / 'faiss.index'
 METADATA_IN = ROOT / 'data' / 'metadata.csv'
 
