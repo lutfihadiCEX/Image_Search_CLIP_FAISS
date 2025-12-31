@@ -1,22 +1,23 @@
-import os
-import sys
-import time
-import math
 from pathlib import Path
-from tqdm import tqdm
-import pandas as pd
+from typing import List, Dict, Any
+import sys
 import numpy as np
+import pandas as pd
+from tqdm import tqdm
 from PIL import Image
 
 import torch
-from transformers import CLIPProcessor, CLIPModel
-from transformers import BlipProcessor, BlipForConditionalGeneration
+from transformers import (
+    CLIPProcessor,
+    CLIPModel,
+    BlipProcessor,
+    BlipForConditionalGeneration,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
-CSV_PATH = ROOT / "merged_nga_cleaned.csv"          
+CSV_PATH = ROOT / "merged_nga_cleaned.csv"
 IMAGES_DIR = ROOT / "data" / "images"
 INDEXES_DIR = ROOT / "indexes"
-os.makedirs(INDEXES_DIR, exist_ok=True)
 
 IMAGE_EMB_OUT = INDEXES_DIR / "image_embeddings.npy"
 TEXT_EMB_OUT = INDEXES_DIR / "text_embeddings.npy"
@@ -25,179 +26,182 @@ META_OUT = INDEXES_DIR / "metadata.csv"
 CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
 BLIP_MODEL_NAME = "Salesforce/blip-image-captioning-base"
 
-BATCH_SIZE = 8    
+BATCH_SIZE = 8
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MAX_IMAGES = None 
+MAX_IMAGES = None
 
-def safe_open_image(path):
+INDEXES_DIR.mkdir(exist_ok=True)
+
+
+def safe_open_image(path: Path) -> Image.Image | None:
+    """Safely open an image and convert to RGB."""
     try:
         return Image.open(path).convert("RGB")
     except Exception as e:
-        print(f"Could not open {path}: {e}")
+        print(f"Failed to open image {path.name}: {e}")
         return None
-    
-def load_matching_rows(df, images_dir):
+
+
+def l2_normalize(vectors: np.ndarray) -> np.ndarray:
+    """L2 normalize embeddings."""
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return vectors / norms
+
+
+def match_images_to_rows(df: pd.DataFrame, images_dir: Path) -> List[Dict[str, Any]]:
     """
-    Match dataset rows with actually downloaded image files by objectid or filename heuristics.
-    
+    Match image files to dataset rows using filename heuristics.
     """
-    files = sorted([p for p in images_dir.iterdir() if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")])
-    file_map = {p.name: p for p in files}
+    image_files = sorted(
+        p for p in images_dir.iterdir()
+        if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
+    )
+
     rows = []
-    for fname, p in file_map.items():
-        parts = fname.split("_")
-        if len(parts) > 0 and parts[0].isdigit():
-            objid = int(parts[0])
-            matched = df[df["objectid"] == objid]
-            if len(matched) > 0:
-                row = matched.iloc[0].to_dict()
-                row["image_filename"] = fname
-                rows.append(row)
-                continue
-        # Fallback purpose. Try to match by iiifurl uuid contained in filename
-        
-        rows.append({
+
+    for img_path in image_files:
+        parts = img_path.stem.split("_")
+        row = {
             "objectid": None,
             "title": None,
             "term": None,
             "iiifurl": None,
-            "image_filename": fname
-        })
+            "image_filename": img_path.name,
+        }
+
+        if parts and parts[0].isdigit():
+            objid = int(parts[0])
+            matched = df[df["objectid"] == objid]
+            if not matched.empty:
+                row.update(matched.iloc[0].to_dict())
+
+        rows.append(row)
+
     return rows
 
-def main():
-    print("Device:", DEVICE)
-    
-    if not CSV_PATH.exists():
-        print(f"CSV file not found at {CSV_PATH}. Update CSV_PATH in script.")
-        sys.exit(1)
 
-    df = pd.read_csv(CSV_PATH)
-    print(f"Loaded dataset rows: {len(df)}")
-
-    
-    rows = load_matching_rows(df, IMAGES_DIR)
-    if MAX_IMAGES:
-        rows = rows[:MAX_IMAGES]
-    print(f"Found {len(rows)} downloaded images to process (from {IMAGES_DIR})")
-
-    
-    print("Loading CLIP model...")
+def load_models():
+    """Load CLIP and BLIP models."""
     clip_model = CLIPModel.from_pretrained(CLIP_MODEL_NAME).to(DEVICE)
     clip_processor = CLIPProcessor.from_pretrained(CLIP_MODEL_NAME)
 
-    print("Loading BLIP captioning model...")
     blip_processor = BlipProcessor.from_pretrained(BLIP_MODEL_NAME)
     blip_model = BlipForConditionalGeneration.from_pretrained(BLIP_MODEL_NAME).to(DEVICE)
 
     clip_model.eval()
     blip_model.eval()
 
+    return clip_model, clip_processor, blip_model, blip_processor
+
+
+def build_composite_text(title: str, term: str, caption: str) -> str:
+    """Combine structured metadata and generated caption."""
+    return " ".join(filter(None, [title, term, caption])).strip()
+
+
+def process_batch(images: List[Image.Image],texts: List[str],clip_model,clip_processor):
+    """Generate CLIP image and text embeddings."""
+    with torch.no_grad():
+        img_inputs = clip_processor(images=images, return_tensors="pt").to(DEVICE)
+        img_feats = clip_model.get_image_features(**img_inputs)
+
+        txt_inputs = clip_processor(text=texts, return_tensors="pt", padding=True).to(DEVICE)
+        txt_feats = clip_model.get_text_features(**txt_inputs)
+
+    return (
+        img_feats.cpu().numpy().astype("float32"),
+        txt_feats.cpu().numpy().astype("float32"),
+    )
+
+
+def main():
+    print("Device:", DEVICE)
+
+    if not CSV_PATH.exists():
+        sys.exit(f"Dataset CSV not found: {CSV_PATH}")
+
+    df = pd.read_csv(CSV_PATH)
+    rows = match_images_to_rows(df, IMAGES_DIR)
+
+    if MAX_IMAGES:
+        rows = rows[:MAX_IMAGES]
+
+    print(f"Processing {len(rows)} images")
+
+    clip_model, clip_processor, blip_model, blip_processor = load_models()
+
     image_embeddings = []
     text_embeddings = []
     metadata_records = []
 
-    # Batching
-    # Generate captions per image 
-    # Batches created for CLIP image encoding and CLIP text encoding.
-    
+    img_batch, text_batch, meta_batch = [], [], []
 
-    img_batch = []
-    text_batch = []
-    meta_batch = []
-
-    def flush_batches(img_batch, text_batch, meta_batch):
-        
-        # Image embeddings
-        if img_batch:
-            inputs = clip_processor(images=img_batch, return_tensors="pt").to(DEVICE)
-            with torch.no_grad():
-                img_feats = clip_model.get_image_features(**inputs)  # (B, D)
-                img_feats = img_feats.cpu().numpy().astype("float32")
-            for fe in img_feats:
-                image_embeddings.append(fe)
-        
-        # Text embeddings
-        if text_batch:
-            inputs = clip_processor(text=text_batch, return_tensors="pt", padding=True).to(DEVICE)
-            with torch.no_grad():
-                txt_feats = clip_model.get_text_features(**inputs)
-                txt_feats = txt_feats.cpu().numpy().astype("float32")
-            for fe in txt_feats:
-                text_embeddings.append(fe)
-        
-        for m in meta_batch:
-            metadata_records.append(m)
-
-    processed = 0
-    pbar = tqdm(rows, total=len(rows))
-    for r in pbar:
-        fname = r["image_filename"]
-        img_path = IMAGES_DIR / fname
-        pil = safe_open_image(img_path)
-        if pil is None:
+    for r in tqdm(rows):
+        img_path = IMAGES_DIR / r["image_filename"]
+        img = safe_open_image(img_path)
+        if img is None:
             continue
 
-        # BLIP caption generation
-        try:
-            
-            blip_inputs = blip_processor(images=pil, return_tensors="pt").to(DEVICE)
-            with torch.no_grad():
-                generated_ids = blip_model.generate(**blip_inputs, max_new_tokens=40)
-                caption = blip_processor.decode(generated_ids[0], skip_special_tokens=True).strip()
-        except Exception as e:
-            print(f"Caption generation failed for {fname}: {e}")
-            caption = ""
+        # Caption generation
+        with torch.no_grad():
+            blip_inputs = blip_processor(images=img, return_tensors="pt").to(DEVICE)
+            caption_ids = blip_model.generate(**blip_inputs, max_new_tokens=40)
+            caption = blip_processor.decode(caption_ids[0], skip_special_tokens=True)
 
-        # Text preparation for embedding process
-        title = r.get("title") or ""
-        term = r.get("term") or ""
-        composite_text = " ".join([str(title), str(term), caption]).strip()
+        composite_text = build_composite_text(
+            r.get("title", ""),
+            r.get("term", ""),
+            caption,
+        )
 
-        
-        img_batch.append(pil)
+        img_batch.append(img)
         text_batch.append(composite_text)
         meta_batch.append({
             "objectid": r.get("objectid"),
-            "image_filename": fname,
-            "title": title,
-            "term": term,
+            "image_filename": r["image_filename"],
+            "title": r.get("title"),
+            "term": r.get("term"),
             "generated_caption": caption,
-            "iiifurl": r.get("iiifurl")
+            "iiifurl": r.get("iiifurl"),
         })
 
-        processed += 1
-        
         if len(img_batch) >= BATCH_SIZE:
-            flush_batches(img_batch, text_batch, meta_batch)
+            img_emb, txt_emb = process_batch(
+                img_batch, text_batch, clip_model, clip_processor
+            )
+            image_embeddings.append(img_emb)
+            text_embeddings.append(txt_emb)
+            metadata_records.extend(meta_batch)
+
             img_batch, text_batch, meta_batch = [], [], []
 
-    
+    # Flush leftovers
     if img_batch:
-        flush_batches(img_batch, text_batch, meta_batch)
+        img_emb, txt_emb = process_batch(
+            img_batch, text_batch, clip_model, clip_processor
+        )
+        image_embeddings.append(img_emb)
+        text_embeddings.append(txt_emb)
+        metadata_records.extend(meta_batch)
 
-    # Include L2 normalized
-    image_embeddings = np.vstack(image_embeddings).astype("float32")
-    text_embeddings = np.vstack(text_embeddings).astype("float32")
+    # Stack & normalize
+    image_embeddings = l2_normalize(np.vstack(image_embeddings))
+    text_embeddings = l2_normalize(np.vstack(text_embeddings))
 
-    
-    def l2_normalize(a):
-        norms = np.linalg.norm(a, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        return a / norms
-
-    image_embeddings = l2_normalize(image_embeddings)
-    text_embeddings = l2_normalize(text_embeddings)
-
-    # Output saved path
+    # Save outputs
     np.save(IMAGE_EMB_OUT, image_embeddings)
     np.save(TEXT_EMB_OUT, text_embeddings)
-    meta_df = pd.DataFrame(metadata_records)
-    meta_df.to_csv(META_OUT, index=False)
+    pd.DataFrame(metadata_records).to_csv(META_OUT, index=False)
 
-    print(f"Saved image embeddings: {IMAGE_EMB_OUT} (shape={image_embeddings.shape})")
-    print(f"Saved text embeddings: {TEXT_EMB_OUT} (shape={text_embeddings.shape})")
-    print(f"Saved metadata: {META_OUT} (rows={len(meta_df)})")
+    print("Saved:")
+    print(f"- Image embeddings: {IMAGE_EMB_OUT} {image_embeddings.shape}")
+    print(f"- Text embeddings: {TEXT_EMB_OUT} {text_embeddings.shape}")
+    print(f"- Metadata: {META_OUT} ({len(metadata_records)} rows)")
+
 
 if __name__ == "__main__":
     main()
+
+
+
